@@ -7,7 +7,7 @@ af = Airframe()
 
 
 def settle_rotor(duty, vel_b, R, t=1.5):
-    x = np.zeros(15)
+    x = af.initial_state()
     x[2] = -60
     x[6:10] = R2q(R)
     x[3:6] = R @ vel_b

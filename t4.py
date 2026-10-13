@@ -8,7 +8,7 @@ for label, R0 in (("tilt 10deg BACK (pitch past vertical)", euler2R(0, np.radian
                   ("tilt 10deg FORWARD", euler2R(0, np.radians(80), 0)),
                   ("tilt 10deg SIDEWAYS (about body z)", euler2R(0, np.radians(90), 0) @ np.array(
                       [[np.cos(.17), -np.sin(.17), 0], [np.sin(.17), np.cos(.17), 0], [0, 0, 1]]))):
-    x = np.zeros(15)
+    x = af.initial_state()
     x[2] = -80
     x[6:10] = R2q(R0)
     x[3:6] = np.array([0, 0, -15.0])        # climbing straight up at 15 m/s

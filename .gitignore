@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 viewer_selftest.png
 
+rcsim/.texcache*
+build/

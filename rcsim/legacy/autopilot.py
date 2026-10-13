@@ -9,7 +9,7 @@ A button pressed in the "wrong" state chains the needed steps (e.g. land from ho
 join approach, land).
 """
 import numpy as np
-from .mathutil import qmul, qconj, R2q, R2euler, euler2R, R_from_nose, wrap
+from ..mathutil import qmul, qconj, R2q, R2euler, euler2R, R_from_nose, wrap, q2R
 
 G = 9.80665
 RHO = 1.225
@@ -19,8 +19,8 @@ ORBIT_R = 60.0
 CRUISE_ALT, CRUISE_V = 28.0, 13.0
 LOOP_ALT = 50.0
 # nominal control power (moment per Pa per command / inertia) used for gain scheduling
-AUTH_Q = np.array([3.6, 2.5, 1.8])         # rad/s^2 per Pa dynamic pressure per unit command
-AUTH_W = np.array([85.0, 168.0, 110.0])    # rad/s^2 per unit command in a hover (T = weight)
+AUTH_Q = np.array([4.4, 1.04, 0.48])       # rad/s^2 per Pa dynamic pressure per unit command
+AUTH_W = np.array([26.0, 29.0, 14.0])      # rad/s^2 per unit command in a hover (T = weight)
 
 
 def clip(x, a, b):
@@ -46,6 +46,12 @@ class Autopilot:
         self.slip_f = 0.0
         self.touch_t = 0.0
         self.final = False
+        self.hov_kp, self.hov_kd, self.hov_amax = 0.25, 0.9, 3.0
+        self.hov_ff = [0.14, 0.0]
+        self.rate_bw = np.array([16.0, 14.0, 14.0])
+        self.hover_bw = np.array([16.0, 32.0, 32.0])      # prop-wash authority is large; hover needs the speed
+        self.nose_h_f = np.zeros(2)
+        self.hc = (0.8, 0.06, 1.2)          # wind-alignment: filter s, min lean, max turn rate rad/s
 
     # ------------------------------------------------------------------ buttons
     def command(self, name):
@@ -76,8 +82,10 @@ class Autopilot:
         """Pick the next state to head towards self.goal from the current (airborne) state."""
         s, g = self.state, self.goal
         if g == 'hover':
-            if s in ('CRUISE', 'LAND'):
+            if s == 'LAND':
                 self._begin_hover_pull()
+            elif s == 'CRUISE':
+                pass                                       # CRUISE rolls wings level first, then pulls up
             elif s == 'LOOP' or s == 'TAKEOFF' or s == 'FROM_HOVER':
                 pass                                       # will dispatch when they finish
         elif g == 'loop':
@@ -126,9 +134,9 @@ class Autopilot:
             w_sp[2] = yaw_rate_sp
         return w_sp
 
-    def rate_ctrl(self, est, w_sp, thr, V, dt):
+    def rate_ctrl(self, est, w_sp, thr, V, dt, bw=None):
         auth = np.maximum(self.authority(V, thr), 12.0)
-        bw = np.array([16.0, 14.0, 14.0])
+        bw = self.rate_bw if bw is None else bw
         Kr = bw / auth
         err = w_sp - est.w
         # integrator trims out steady torques (prop torque, slipstream swirl); light leak against windup
@@ -235,8 +243,15 @@ class Autopilot:
             hdg, _ = self.orbit_heading(pos)
             phi, tr = self.bank_from_heading(est, hdg, V)
             th, thr = self.tecs(est, CRUISE_ALT, CRUISE_V, V)
+            lvl = self.goal == 'hover'
+            if lvl:                           # pulling up from a bank rolls the nose over the top: level first
+                phi, tr = 0.0, 0.0
             u = self.fwd_att(est, phi, th, thr, V, dt, turn_rate=tr)
-            if self.goal in ('hover', 'loop', 'land') and self.t_state > 1.0:
+            if lvl:
+                if self.t_state > 1.0 and abs(roll) < 0.10 and abs(pitch) < 0.18 and abs(est.w[0]) < 0.25 \
+                        and abs(vel[2]) < 1.5:
+                    self._begin_hover_pull()
+            elif self.goal in ('loop', 'land') and self.t_state > 1.0:
                 self._dispatch()
 
         elif s == 'LOOP_PREP':
@@ -296,19 +311,27 @@ class Autopilot:
             w_ff = np.array([0.0, rate if self.th_cmd < np.pi / 2 else 0.0, 0.0])
             thr = 1.0 if (pitch < 1.3 or V > 6.0) else self.thr_h      # a slow prop makes no thrust at 16 m/s
             w_sp = self.att_ctrl(est, R_des, w_ff, thr, V)
-            u = self.rate_ctrl(est, w_sp, thr, V, dt)
-            if self.th_cmd >= np.pi / 2 - 1e-6 and pitch > 1.35:
+            if pitch > 1.0:                   # nearly vertical: same sideslip weathervane as in the hover
+                u = self.rate_ctrl(est, w_sp, thr, V, dt, bw=self.hover_bw)
+                vb = q2R(est.q).T @ est.vel
+                u[2] = clip(u[2] - self.hov_ff[0] * vb[1], -1, 1)
+            else:
+                u = self.rate_ctrl(est, w_sp, thr, V, dt)
+            if self.th_cmd >= np.pi / 2 - 1e-6 and pitch > 1.35 and (-q2R(est.q)[2, 0] > 0.99 or self.t_state > 6.0):
                 self.hover_tgt = np.array([pos[0] + vel[0] * 1.5, pos[1] + vel[1] * 1.5, 0.0])
-                self.alt_tgt = 35.0
+                # hold roughly where the zoom climb is going to end up; never command a descent from
+                # here (a low-throttle hover has no prop wash, so no control authority)
+                self.alt_tgt = max(alt + max(-vel[2], 0.0) * 1.5, 25.0)
                 self._go('HOVER')
                 self.hover_int = 0.0
+                self.nose_h_f[:] = 0.0
                 self.th_cmd = np.pi / 2
 
         elif s == 'HOVER':
             # horizontal: position -> accel -> nose tilt
             ep = self.hover_tgt[:2] - pos[:2]
-            a_cmd = 0.25 * ep - 0.9 * vel[:2]
-            amax = 3.0
+            a_cmd = self.hov_kp * ep - self.hov_kd * vel[:2]
+            amax = self.hov_amax
             na = np.linalg.norm(a_cmd)
             if na > amax:
                 a_cmd *= amax / na
@@ -321,11 +344,27 @@ class Autopilot:
             vz_t = clip(0.5 * (self.alt_tgt - alt), -2.0, 2.0)
             ez = vz_t - (-vel[2])
             self.hover_int = clip(self.hover_int + 0.04 * ez * dt, -0.2, 0.2)
-            thr = clip(thr_ff + 0.12 * ez + self.hover_int, 0.2, 1.0)
+            thr = clip(thr_ff + 0.12 * ez + self.hover_int, 0.4, 1.0)
             if -vel[2] > 2.0:
-                thr = max(thr, 0.65)          # shedding climb speed: keep prop wash over the tail for authority
+                # shedding climb speed: keep prop wash over the tail for authority, but stay just below
+                # hover thrust or the climb never stops
+                thr = max(thr, self.thr_h - 0.03)
             w_sp = self.att_ctrl(est, R_des, np.zeros(3), thr, V, yaw_gain=6.0)
-            u = self.rate_ctrl(est, w_sp, thr, V, dt)
+            u = self.rate_ctrl(est, w_sp, thr, V, dt, bw=self.hover_bw)
+            # Wind makes the nose lean upwind.  The fin is a much poorer sideways-gust fighter than the
+            # elevator is fore/aft, so slowly turn the belly to face along the wind line.
+            self.nose_h_f += (dt / self.hc[0]) * (q2R(est.q)[:2, 0] - self.nose_h_f)
+            if np.linalg.norm(self.nose_h_f) > self.hc[1]:
+                ang = np.arctan2(self.nose_h_f[1], self.nose_h_f[0])
+                d = wrap(ang - self.hdg_hold)
+                if abs(d) > np.pi / 2:
+                    d = wrap(d - np.pi)
+                self.hdg_hold = wrap(self.hdg_hold + clip(1.5 * d, -self.hc[2], self.hc[2]) * dt)
+            # Sideways drift acts on the fin like a weathervane that tips the nose further into the drift
+            # (positive feedback, ~50 rad/s^2 per m/s); cancel it with rudder/elevator feed-forward.
+            vb = q2R(est.q).T @ est.vel
+            u[2] = clip(u[2] - self.hov_ff[0] * vb[1], -1, 1)
+            u[1] = clip(u[1] + self.hov_ff[1] * vb[2], -1, 1)
             if self.goal in ('loop', 'land', 'cruise') and self.t_state > 1.5:
                 self._dispatch()
 

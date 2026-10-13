@@ -5,8 +5,8 @@ Attitude uses the accelerometer only when |f| is close to 1 g (unaccelerated), s
 through loops on the gyro and re-converges afterwards.
 """
 import numpy as np
-from .mathutil import qmul, q2R, R2q, R2euler, euler2R
-from .sensors import MAG_NED, DECL, MOTOR_FIELD
+from ..mathutil import qmul, q2R, R2q, R2euler, euler2R
+from ..sensors import MAG_NED, DECL, MOTOR_FIELD
 
 G = 9.80665
 
