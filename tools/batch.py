@@ -21,6 +21,7 @@ MISSIONS = {
     'short': ([(0, 'takeoff'), (22, 'loop'), (38, 'hover'), (55, 'land')], 260.0),
     'land': ([(0, 'takeoff'), (20, 'land')], 150.0),
 }
+MORPH = 0.0          # mean interval of random in-flight changes (s), 0 = off; --morph S
 RWY_X = (-75.0, 135.0)
 RWY_HALF_W = 5.5
 ON_RUNWAY_STATES = ('INIT', 'GROUND', 'TAKEOFF', 'FINAL', 'FLARE', 'ROLLOUT', 'GO_AROUND')
@@ -40,8 +41,9 @@ def random_plane(rng):
 
 
 def fly(job):
-    """One mission. job = (plane dict, sim seed, mission name, cfg overrides dict)."""
-    plane, seed, mission, overrides = job
+    """One mission. job = (plane dict, sim seed, mission name, cfg overrides dict[, morph interval s])."""
+    plane, seed, mission, overrides = job[:4]
+    morph = job[4] if len(job) > 4 else MORPH
     from rcsim.world import Sim
     from rcsim import fcbridge as fb
     cfg = fb.default_config()
@@ -53,7 +55,7 @@ def fly(job):
         else:
             setattr(cfg, k, type(cur)(v))
     sched, tmax = MISSIONS[mission]
-    s = Sim(seed=seed, plane=plane, cfg=cfg)
+    s = Sim(seed=seed, plane=plane, cfg=cfg, morph=morph)
     side = cfg.fly_side
     i = 0
     worst_pilot_side = 0.0          # how far onto the pilot's side of the runway edge, while airborne
@@ -88,7 +90,8 @@ def fly(job):
     return dict(plane=plane, seed=seed, ok=ok, crashed=s.af.crashed, reason=s.af.crash_reason, state=s.ap.state,
                 t=s.t, pos=(float(x), float(y)), td=None if td is None else (float(td[0]), float(td[1])),
                 go_arounds=gas, pilot_side=float(worst_pilot_side), box=float(worst_box), ps_where=ps_where, box_where=box_where,
-                auth=[round(a, 2) for a in s.fout.auth_q[:]])
+                auth=[round(a, 2) for a in s.fout.auth_q[:]],
+                morphs=len(s.morpher.events) if s.morpher else 0, morph_now=dict(s.af.morph))
 
 
 def _fly_idx(arg):
@@ -114,7 +117,8 @@ def line(r):
     return (f"{'OK ' if r['ok'] else 'BAD'} size x{p['scale']:.2f} surf x{p['surf']:.2f} thrust x{p['thrust']:.2f} "
             f"mass x{p['mass']:.2f} wing x{p['wing']:.2f}: {r['state']:9s} pos ({r['pos'][0]:6.1f},{r['pos'][1]:5.1f}) "
             f"GA {r['go_arounds']} pilot-side {r['pilot_side']:4.1f} m {r['ps_where']}  box {r['box']:5.1f} m {r['box_where']}  "
-            f"auth {r['auth']}" + (f"  [{r['reason']}]" if r['crashed'] else ''))
+            f"auth {r['auth']}" + (f"  morphs {r['morphs']} now " + '/'.join(f"{v:.2f}" for v in r['morph_now'].values())
+                                    if r.get('morphs') else '') + (f"  [{r['reason']}]" if r['crashed'] else ''))
 
 
 def make_jobs(n, seed, mission, overrides=None):
@@ -145,6 +149,7 @@ if __name__ == '__main__':
     seed = opt('--seed', 1, int)
     mission = opt('--mission', 'full')
     workers = opt('--workers', None, int)
+    MORPH = opt('--morph', 0.0, float)
     ov = opt('--cfg', '')
     overrides = {k: float(v) for k, v in (kv.split('=') for kv in ov.split(','))} if ov else None
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 12

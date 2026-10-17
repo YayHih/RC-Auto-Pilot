@@ -7,14 +7,17 @@ PCA9685 counts that drive the servos, exactly as the board does; `--fc arm` even
 Run:      `.venv/bin/python viewer.py`  (Windows: `.venv\Scripts\python viewer.py`)
           buttons TAKEOFF / HOVER / LOOP / LAND, MANUAL / ASSIST, wind sliders - see the docstring in viewer.py
           options: `--seed N --wind M/S --wind-from DEG --turb X --no-random --fc native|arm --plane ail=0.6,ele=1.4,...`
+          `--morph 20`: the aeroplane changes in flight every ~20 s (control-surface size, wing chord, drag plate),
+          drawn on the 3-D model and listed in the text panel next to what the flight controller has learned
 Install:  `python3 -m venv .venv && .venv/bin/pip install numpy matplotlib pygame unicorn`  (+ a C++ compiler; the
           CubeCell board package in the Arduino IDE / arduino-cli provides the ARM toolchain)
 Headless: `.venv/bin/python scenario.py "0:takeoff,25:loop,45:hover,70:loop,95:hover,115:land" 320 3 out.png`
           `[--fc native|arm|lockstep] [--plane ail=0.6,ele=1.4,rud=1,mass=1.2,thrust=1] [--cfg adapt_enable=0,rwy_hdg_deg=0]`
 Checks:   `.venv/bin/python tests/physics_check.py`  physics (energy / momentum conservation, glide, phugoid, ...)
           `.venv/bin/python tests/fc_check.py`       flash/RAM, ARM vs PC bit-identical for a whole mission, cycles per tick
-Batch:    `caffeinate -is .venv/bin/python tools/batch.py 16 --mission short`  many random aeroplanes (size, control-surface
-          size, per-axis control power, thrust, mass, wing area) in random wind, one worker per performance core
+Batch:    `caffeinate -is .venv/bin/python tools/batch.py 16 --mission short [--morph 15]`  many random aeroplanes (size,
+          control-surface size, per-axis control power, thrust, mass, wing area) in random wind, one worker per
+          performance core; --morph adds random in-flight changes
 Tuning:   `caffeinate -is .venv/bin/python tools/tune.py 12 10 10`  hyper-parameter search over those aeroplanes
           (`caffeinate` keeps the Mac from sleeping during long runs; idle sleep otherwise suspends them)
 Flash:    open `firmware/RCAutopilot/RCAutopilot.ino`, board "CubeCell-Board (HTCC-AB01)", or
@@ -43,6 +46,15 @@ Hardware (beyond the HTCC-AB01 + M10 GPS/compass you have)
 - PCA9685 16-channel servo board: the AB01 has only two hardware PWM pins and the plane needs 4-5 outputs.
 - An RC receiver with CPPM output for manual control / the mode switch (strongly recommended: it is your safety pilot).
 - The AB01 has one UART: it goes to the GPS, so there is no USB serial while flying (`#define BENCH_DEBUG` for the bench).
+
+Aeroplanes that change in flight (`Sim(morph=S)`, `rcsim/world.py: Morpher`)
+- Every ~S s, once airborne, one property ramps over 2 s to a new random value: aileron / elevator / rudder size x0.5-1.8
+  (more effectiveness ~ size^0.6, a little more drag), wing chord x0.75-1.3 (more lift and area, lower aspect ratio),
+  drag x1-3 (an airbrake plate on top of the fuselage).  Mass and CG do not change.  `Airframe.set_morph()`.
+- The 3-D model draws the real surface and wing chords and the airbrake plate, so the changes are visible.
+- The flight controller is not told.  Its authority learner forgets with a ~15 s memory and has a change detector
+  (two 2 s windows in a row > 2 sigma off -> re-learn), so it follows a changed surface within ~10-15 s
+  (mean error 9-15 % per axis while things keep changing).
 
 How the controller copes with different aeroplanes and with wind
 - Control authority: a small dither on each surface (roll 5 Hz, pitch 4 Hz, yaw 3 Hz, < 1 deg of wobble) and a lock-in
@@ -83,15 +95,19 @@ the view show it.  Every run is random (airframe tolerances, mean wind, wander, 
 
 Results (randomised aeroplanes: size x0.85-1.2, control-surface size x0.7-1.4, per-axis control power x0.8-1.25, thrust
 x0.8-1.25, mass x0.9-1.2, wing area x0.85-1.15; random wind up to 4.5 m/s + turbulence; the FC is not told the plane):
-- full mission (take-off, loop, hover, loop, hover, land), 32 unseen planes: 32/32 landed and stopped on the runway,
-  0 crashes, mean lateral stop error ~1.6 m
+- full mission (take-off, loop, hover, loop, hover, land), fixed planes: 48/48 landed and stopped on the runway
+- full mission with the plane changing in flight every ~15-20 s: 48/48; every ~8 s (about 18 changes per flight): 16/16
+- 0 crashes in all of these, mean lateral stop error 1.0-1.9 m
+- M0+ timing: worst tick 6.8 ms of the 10 ms (incl. ~1 ms of I2C), ARM and PC builds bit-identical (tests/fc_check.py)
 - tuning (tools/tune.py, 21 candidates x 12 planes) picked the defaults in fc_default_config; on 48 unseen planes the
   tuned set landed 48/48 with a ~30 % shorter final than the hand-set values
 
-Known limits: the tail-sitter hover is marginal in strong wind (the small fin weathervanes the nose into a sideways drift)
-and a weak aeroplane can drift a long way downwind in it.  In the last 32-plane run 4 flights crossed the runway edge onto
-the pilot's side while airborne: three by 0.4-3.5 m (end of the climb-out / joining final) and one far out (~70 m) whose
-cause has not been traced yet - check tools/batch.py output before trusting the fence near people.
+Known limits: the tail-sitter hover is marginal in strong wind (the small fin weathervanes the nose into a sideways
+drift).  The hover now leans up to ~27 deg into the wind and aborts (flies out on a safe heading) if it drifts to within
+5 m of the fence or 30 m off its spot - that was the cause of the earlier ~70 m incursion over the pilot's side.  The
+transition out of the hover never points at the pilot.  Remaining incursions past the runway edge are small (0.1-1.3 m
+in the last 128 flights: end of a climb-out, or crossing towards the descent orbit) - still check tools/batch.py output
+before trusting the fence near people.
 Gain priors (auth_q0 / auth_w0 in fc.cpp) come from ident.py on the nominal model; the lock-in calibration
 (auth_lockin_cal*) was taken on the nominal sim plane.  t2.py, t3.py and t5.py poke at the old Python autopilot and no
 longer run.

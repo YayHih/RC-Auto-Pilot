@@ -1,5 +1,7 @@
 """Interactive viewer (pygame):  python viewer.py [--seed N] [--wind M/S] [--wind-from DEG] [--turb X] [--no-random]
                                                   [--fc native|arm] [--plane ail=0.6,ele=1.4,rud=1,mass=1.2,thrust=1]
+                                                  [--morph S]   (random in-flight changes every ~S s: control-surface
+                                                                 size, wing chord, drag plate - drawn on the model)
                                                   [--screenshots DIR]   (headless: render each camera to DIR, report timing)
 The aeroplane is flown by the C++ flight controller in firmware/RCAutopilot/src/fc - the same code that
 runs on the Heltec (--fc arm runs its Cortex-M0+ machine code in an emulator; slower than real time).
@@ -47,6 +49,7 @@ RANDOMIZE = 0.0 if '--no-random' in sys.argv else 1.0
 FC_KIND = _arg('--fc', 'native', str)
 _PL = _arg('--plane', None, str)
 PLANE = {k: float(v) for k, v in (kv.split('=') for kv in _PL.split(','))} if _PL else None
+MORPH = _arg('--morph', 0.0)
 FENCE_M = 15.0                         # cfg.fence_m: manoeuvres stay east of this (cfg.fly_side = +1)
 ORBIT_R = 60.0
 ORBIT_C = np.array([90.0, FENCE_M + ORBIT_R + 5.0])   # loiter circle (autopilot.cpp, runway heading north)
@@ -141,7 +144,8 @@ class App:
 
     # ------------------------------------------------------------------ sim control
     def _new_sim(self, seed):
-        return Sim(seed=seed, wind=WIND, wind_from=WIND_FROM, turb=TURB, randomize=RANDOMIZE, fc=FC_KIND, plane=PLANE)
+        return Sim(seed=seed, wind=WIND, wind_from=WIND_FROM, turb=TURB, randomize=RANDOMIZE, fc=FC_KIND, plane=PLANE,
+                   morph=MORPH)
 
     def reset(self):
         was_manual, was_assist = self.sim.manual, self.sim.assist
@@ -513,16 +517,17 @@ class App:
                  f"airspeed {np.linalg.norm(x[3:6] - s.wind_now) * 3.6:5.1f} km/h (est {o.airspeed * 3.6:5.1f})  T {s.T / (s.af.m * 9.81):.1f}x wt",
                  f"wind est {np.hypot(*we):4.1f} m/s from {np.degrees(np.arctan2(-we[1], -we[0])) % 360:3.0f}"
                  f"  (true {np.hypot(*wt):4.1f} from {np.degrees(np.arctan2(-wt[1], -wt[0])) % 360:3.0f})",
-                 f"learned authority a/e/r  x{o.auth_q[0]:.2f} x{o.auth_q[1]:.2f} x{o.auth_q[2]:.2f}  wash x{o.auth_w[1]:.2f}",
+                 f"learned authority a/e/r x{o.auth_q[0]:.2f}/{o.auth_q[1]:.2f}/{o.auth_q[2]:.2f}  wash x{o.auth_w[1]:.2f}",
+                 "plane now: surf x{ail:.2f}/{ele:.2f}/{rud:.2f} wing x{wing:.2f} drag x{drag:.2f}".format(**s.af.morph),
                  f"PCA9685 out {' '.join(str(c) for c in o.pca_off[:5])}   [{s.fc_kind}]"]
         pygame.draw.rect(self.screen, PANEL, self.TXT)
         pygame.draw.rect(self.screen, EDGE, self.TXT, 1)
         for i, ln in enumerate(lines):
-            self._text(self.screen, ln, (self.TXT.x + 8, self.TXT.y + 4 + 15 * i), self.fonts, FG, shadow=False)
+            self._text(self.screen, ln, (self.TXT.x + 8, self.TXT.y + 3 + 13 * i), self.fonts, FG, shadow=False)
         hint = (['arrows pitch/roll (down = climb)  a/d rudder', 'w/s throttle  z cut  x full   m = back to auto'] if s.manual else
                 ['1 takeoff 2 hover 3 loop 4 land   m manual', 'c view  r reset  q quality  [ ] , . - = u i wind'])
         for i, ln in enumerate(hint):
-            self._text(self.screen, ln, (self.TXT.x + 8, self.TXT.y + 110 + 14 * i), self.fonts, DIM, shadow=False)
+            self._text(self.screen, ln, (self.TXT.x + 8, self.TXT.y + 110 + 13 * i), self.fonts, DIM, shadow=False)
 
     def draw_ui(self):
         scr = self.screen
@@ -618,6 +623,9 @@ def screenshots(outdir):
         app.step_sim()
     app.draw_frame()
     pygame.image.save(app.screen, os.path.join(outdir, 'manual_closeup.png'))
+    app.sim.af.set_morph(ail=1.8, ele=1.7, rud=1.7, wing=1.3, drag=3.0)     # the same moment, a changed aeroplane
+    app.draw_frame()
+    pygame.image.save(app.screen, os.path.join(outdir, 'morph_closeup.png'))
     print('ms/frame incl. sim + UI:', {k: round(v, 1) for k, v in times.items()})
 
 

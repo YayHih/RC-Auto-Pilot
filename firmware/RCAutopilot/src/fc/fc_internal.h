@@ -66,13 +66,17 @@ typedef struct {
     uint16_t k;             /* tick within window */
     uint8_t valid, have_prev;
     float amp[3];           /* dither amplitude, steered so the net surface motion is ~3.5 % */
+    uint8_t surprise[3];    /* consecutive windows that disagreed with the estimate (change detector) */
+    /* finished window, evaluated one axis per tick so it never lands on one tick with GPS work */
+    float wys[3], wyc[3], wus[3], wuc[3], wrq[3], wrw[3], wVm;
+    uint8_t pend;
     uint16_t windows[3];    /* accepted windows per axis (telemetry) */
 } Adapt;
 
 void adapt_reset(Adapt *a);
 void adapt_dither(const Adapt *a, const fc_config_t *c, float qbar, float tw, int enable, float d[3]);
 void adapt_update(Adapt *a, const fc_config_t *c, const float w[3], const float u[3], float qbar,
-                  float tw, float V, int enable);
+                  float tw, float V, int enable, int light_tick);
 float adapt_scale_q(const Adapt *a, int i);
 float adapt_scale_w(const Adapt *a, int i);
 
@@ -85,8 +89,9 @@ typedef struct {
     float gam_prev, gam_unw, slip_f, glide_int, spd_int, touch_t, slow_t;
     float hover_tgt[2], nose_h_f[2];
     float home[2], rwy_hdg, land_dir;
+    float rwy_c, rwy_s;     /* cos/sin of rwy_hdg, refreshed each tick (trig is ~3k cycles on the M0+) */
     float out[5];           /* da de dr thr brake */
-    uint8_t armed, prev_rc, rwy_src;     /* rwy_src: 0 line-up compass, 1 GPS roll track, 2 config */
+    uint8_t armed, prev_rc, rwy_src, exit_ok;   /* exit_ok: hover has turned to a safe exit heading */     /* rwy_src: 0 line-up compass, 1 GPS roll track, 2 config */
     float trk_n, trk_e;
 } AP;
 

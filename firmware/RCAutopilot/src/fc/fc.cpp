@@ -192,7 +192,7 @@ void fc_tick(const fc_in_t *in, fc_out_t *out)
         adapt_dither(&fc->adapt, c, fc->qbar, tw, en, d);
         for (int i = 0; i < 3; i++) fc->ap.out[i] = f_clamp(fc->ap.out[i] + d[i], -1.0f, 1.0f);
         float w[3] = {e->w.x, e->w.y, e->w.z};
-        adapt_update(&fc->adapt, c, w, fc->ap.out, fc->qbar, tw, fc->V, en);
+        adapt_update(&fc->adapt, c, w, fc->ap.out, fc->qbar, tw, fc->V, en, light && !do_est && !do_wind);
     }
 
     /* ---- outputs: PCA9685 counts */

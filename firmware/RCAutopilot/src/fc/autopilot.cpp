@@ -153,7 +153,7 @@ static void tecs(FC *fc, float alt_t, float V_t, float V, float *theta, float *t
 
 static void rwy_point(const AP *ap, float s, float t, float *n, float *e)
 {
-    float c = f_cos(ap->rwy_hdg), sn = f_sin(ap->rwy_hdg);
+    float c = ap->rwy_c, sn = ap->rwy_s;
     *n = ap->home[0] + s * c - t * sn;
     *e = ap->home[1] + s * sn + t * c;
 }
@@ -163,7 +163,7 @@ static float side_dist(const FC *fc, v3 p)
 {
     const AP *ap = &fc->ap;
     float dn = p.x - ap->home[0], de = p.y - ap->home[1];
-    float t = -dn * f_sin(ap->rwy_hdg) + de * f_cos(ap->rwy_hdg);
+    float t = -dn * ap->rwy_s + de * ap->rwy_c;
     return (float)fc->cfg.fly_side * t;
 }
 
@@ -183,16 +183,25 @@ static void bank_side(const FC *fc, v3 p, float hdg, float V, float lim, float *
 {
     float crs = course(fc);
     float err = f_wrap(hdg - crs);
-    float r_turn = V * V / (F_G * f_tan(lim) + 1e-3f);
-    if (f_abs(err) > 1.4f && side_dist(fc, p) < fc->cfg.fence_m + 2.5f * r_turn) {
+    if (f_abs(err) > 1.4f && side_dist(fc, p) < fc->cfg.fence_m + 2.5f * V * V / (F_G * f_tan(lim) + 1e-3f)) {
         /* velocity change of a right turn (heading increasing) is along (-sin, cos) of the course */
         float fs = (float)fc->cfg.fly_side;
-        float good = fs * (-f_sin(crs) * -f_sin(fc->ap.rwy_hdg) + f_cos(crs) * f_cos(fc->ap.rwy_hdg));
+        float good = fs * (f_sin(crs) * fc->ap.rwy_s + f_cos(crs) * fc->ap.rwy_c);
         if (good > 0.0f && err < 0.0f) err += F_2PI;        /* turn right */
         else if (good < 0.0f && err > 0.0f) err -= F_2PI;   /* turn left */
     }
     *phi = f_clamp(1.4f * err, -lim, lim);
     *tr = F_G * f_tan(*phi) / f_max(V, 6.0f);
+}
+
+/* the transition out of the hover dives towards the belly heading: never towards the pilot.  Keep it
+ * within ~70 deg of straight away from the runway (parallel to it at worst). */
+static float safe_exit(const FC *fc, float h)
+{
+    float away = f_wrap(fc->ap.rwy_hdg + (float)fc->cfg.fly_side * F_PI_2);
+    float d = f_wrap(h - away);
+    const float lim = F_PI_2 - 0.35f;
+    return f_abs(d) <= lim ? h : f_wrap(away + f_sign(d) * lim);
 }
 
 static float hold_s(const fc_config_t *c)
@@ -269,15 +278,15 @@ static void dispatch(FC *fc)
         if (s == ST_LAND) go(ap, ST_TO_HOVER);
         else if (s == ST_FINAL) go(ap, ST_GO_AROUND);
     } else if (g == FC_CMD_LOOP) {
-        if (s == ST_HOVER) go(ap, ST_FROM_HOVER);
+        if (s == ST_HOVER) { if (ap->exit_ok) go(ap, ST_FROM_HOVER); }
         else if (s == ST_CRUISE) go(ap, ST_LOOP_PREP);
         else if (s == ST_LAND) go(ap, ST_CRUISE);
         else if (s == ST_FINAL) go(ap, ST_GO_AROUND);
     } else if (g == FC_CMD_LAND) {
-        if (s == ST_HOVER) go(ap, ST_FROM_HOVER);
+        if (s == ST_HOVER) { if (ap->exit_ok) go(ap, ST_FROM_HOVER); }
         else if (s == ST_CRUISE) begin_land(fc);
     } else if (g == FC_CMD_CRUISE) {
-        if (s == ST_HOVER) go(ap, ST_FROM_HOVER);
+        if (s == ST_HOVER) { if (ap->exit_ok) go(ap, ST_FROM_HOVER); }
         else if (s == ST_LAND || s == ST_LOOP_PREP) go(ap, ST_CRUISE);
         else if (s == ST_FINAL) go(ap, ST_GO_AROUND);
     }
@@ -335,6 +344,7 @@ void ap_update(FC *fc, const fc_in_t *in, float dt)
         R_to_euler(&R, &fc->yaw, &fc->pitch, &fc->roll);
     }
     float yaw = fc->yaw, pitch = fc->pitch, roll = fc->roll;
+    ap->rwy_c = f_cos(ap->rwy_hdg); ap->rwy_s = f_sin(ap->rwy_hdg);
     float thr = 0.0f, brake = 0.0f;
     float u[3] = {0.0f, 0.0f, 0.0f};
 
@@ -390,7 +400,10 @@ void ap_update(FC *fc, const fc_in_t *in, float dt)
         } else {
             if (ap->phase == 0 && ap->rwy_src == 0 && (ap->trk_n != 0.0f || ap->trk_e != 0.0f)) {
                 float trk = f_atan2(ap->trk_e, ap->trk_n);
-                if (f_abs(f_wrap(trk - ap->rwy_hdg)) < 0.35f) { ap->rwy_hdg = trk; ap->land_dir = trk; ap->rwy_src = 1; }
+                if (f_abs(f_wrap(trk - ap->rwy_hdg)) < 0.35f) {
+                    ap->rwy_hdg = trk; ap->land_dir = trk; ap->rwy_src = 1;
+                    ap->rwy_c = f_cos(trk); ap->rwy_s = f_sin(trk);
+                }
             }
             ap->phase = 1;
             float theta = f_clamp(0.14f + 0.05f * (V - 11.0f), 0.05f, 0.42f);
@@ -549,7 +562,7 @@ void ap_update(FC *fc, const fc_in_t *in, float dt)
         float an = 0.25f * (ap->hover_tgt[0] - pos.x) - 0.9f * vel.x;
         float ae = 0.25f * (ap->hover_tgt[1] - pos.y) - 0.9f * vel.y;
         float na = f_sqrt(an * an + ae * ae);
-        if (na > 3.0f) { an *= 3.0f / na; ae *= 3.0f / na; }
+        if (na > 5.0f) { an *= 5.0f / na; ae *= 5.0f / na; }       /* up to ~27 deg of lean into the wind */
         float tn = an / F_G, te = ae / F_G;
         float nz = f_sqrt(f_max(1.0f - tn * tn - te * te, 0.5f));
         v3 n = v3_make(tn, te, -nz);
@@ -564,9 +577,16 @@ void ap_update(FC *fc, const fc_in_t *in, float dt)
         rate_ctrl(fc, w_sp, thr, V, BW_HOVER, u);
         /* wind leans the nose upwind; slowly turn the belly to face along the wind line */
         m33 R = q_to_R(fc->est.q);
+        /* hover abort: blown towards the pilot's side or far off its spot -> fly out of it */
+        {
+            float dn = pos.x - ap->hover_tgt[0], de = pos.y - ap->hover_tgt[1];
+            if (side_dist(fc, pos) < c->fence_m + 5.0f || dn * dn + de * de > 30.0f * 30.0f)
+                if (ap->goal == FC_CMD_HOVER || ap->goal == FC_CMD_NONE) { ap->goal = FC_CMD_CRUISE; ap->t_state = f_max(ap->t_state, 1.6f); }
+        }
+        int leaving = (ap->goal == FC_CMD_LOOP || ap->goal == FC_CMD_LAND || ap->goal == FC_CMD_CRUISE) && ap->t_state > 1.5f;
         ap->nose_h_f[0] += (dt / 0.8f) * (R.m[0][0] - ap->nose_h_f[0]);
         ap->nose_h_f[1] += (dt / 0.8f) * (R.m[1][0] - ap->nose_h_f[1]);
-        if (f_sqrt(ap->nose_h_f[0] * ap->nose_h_f[0] + ap->nose_h_f[1] * ap->nose_h_f[1]) > 0.06f) {
+        if (!leaving && f_sqrt(ap->nose_h_f[0] * ap->nose_h_f[0] + ap->nose_h_f[1] * ap->nose_h_f[1]) > 0.06f) {
             float ang = f_atan2(ap->nose_h_f[1], ap->nose_h_f[0]);
             float d = f_wrap(ang - ap->hdg_hold);
             if (f_abs(d) > F_PI_2) d = f_wrap(d - F_PI);
@@ -574,10 +594,21 @@ void ap_update(FC *fc, const fc_in_t *in, float dt)
         }
         v3 vb = RT_mul(&R, vel);
         u[2] = f_clamp(u[2] - 0.14f * vb.y, -1.0f, 1.0f);
-        if ((ap->goal == FC_CMD_LOOP || ap->goal == FC_CMD_LAND || ap->goal == FC_CMD_CRUISE) && ap->t_state > 1.5f) {
-            ap->thr_h = f_clamp(ap->thr_h + ap->hover_int, 0.3f, 0.9f);   /* remember this plane's hover throttle */
-            ap->hover_int = 0.0f;
-            dispatch(fc);
+        if (leaving) {
+            /* turn the belly to a safe exit heading first, then go */
+            float want = safe_exit(fc, ap->hdg_hold);
+            float d = f_wrap(want - ap->hdg_hold);
+            ap->hdg_hold = f_wrap(ap->hdg_hold + f_clamp(d, -1.0f * dt, 1.0f * dt));
+            float belly = f_atan2(R.m[1][2], R.m[0][2]);
+            int aligned = f_abs(d) < 0.02f && f_abs(f_wrap(belly - ap->hdg_hold)) < 0.35f;
+            if (aligned || ap->t_state > 1.5f + 4.0f + 3.2f) {
+                ap->thr_h = f_clamp(ap->thr_h + ap->hover_int, 0.3f, 0.9f);   /* remember this plane's hover throttle */
+                ap->hover_int = 0.0f;
+                ap->hdg_hold = safe_exit(fc, ap->hdg_hold);
+                ap->exit_ok = 1;
+                dispatch(fc);
+                ap->exit_ok = 0;
+            }
         }
         break;
     }

@@ -160,9 +160,65 @@ void adapt_dither(const Adapt *a, const fc_config_t *c, float qbar, float tw, in
         d[i] = enable ? a->amp[i] * tsin(a->k, i) : 0.0f;
 }
 
-void adapt_update(Adapt *a, const fc_config_t *c, const float w[3], const float u[3], float qbar,
-                  float tw, float V, int enable)
+static void window_axis(Adapt *a, const fc_config_t *c, int i)
 {
+    const float invN = 1.0f / (float)AD_WIN;
+    float Y = f_sqrt(a->wys[i] * a->wys[i] + a->wyc[i] * a->wyc[i]);
+    float U = f_sqrt(a->wus[i] * a->wus[i] + a->wuc[i] * a->wuc[i]);
+    float Unet = U * 2.0f * invN;
+    a->amp[i] = f_clamp(a->amp[i] * f_clamp(AD_UNET / f_max(Unet, 1e-3f), 0.5f, 2.0f), 0.02f, 0.12f);
+    if (Unet < 0.6f * AD_UNET) return;         /* too small yet: backlash would bias it */
+    float Om = F_2PI * (float)AD_HZ[i];
+    float servo = 1.0f / f_sqrt(1.0f + Om * SERVO_TAU * Om * SERVO_TAU);
+    float D = AD_D0[i] * a->wVm;
+    float phi[2] = {a->wrq[i] * invN, a->wrw[i] * invN};
+    float cal = (c->auth_lockin_cal[i] * phi[0] + c->auth_lockin_cal_w[i] * phi[1]) / f_max(phi[0] + phi[1], 1e-6f);
+    float A = Y / (U * servo) * f_sqrt(1.0f + (D / Om) * (D / Om)) / cal;
+    /* only learn the part this flight condition actually exercises */
+    if (phi[1] < 0.25f * phi[0]) phi[1] = 0.0f;
+    else if (phi[0] < 0.25f * phi[1]) phi[0] = 0.0f;
+    /* normalise by the expected measurement scatter (~15 %) */
+    float sig = 0.15f * f_max(A, 8.0f);
+    phi[0] /= sig; phi[1] /= sig;
+    float y = A / sig;
+    float (*P)[2] = a->P[i];
+    float Pp0 = P[0][0] * phi[0] + P[0][1] * phi[1];
+    float Pp1 = P[1][0] * phi[0] + P[1][1] * phi[1];
+    /* ~15 s memory: the aeroplane can change in flight (damage, a different surface, ...) */
+    const float lam = 0.88f;
+    float den = lam + phi[0] * Pp0 + phi[1] * Pp1;
+    float e = y - (a->s[i][0] * phi[0] + a->s[i][1] * phi[1]);
+    /* change detector: two windows in a row more than 2 sigma off -> forget, re-learn fast */
+    if (e * e > 4.0f * den) {
+        if (++a->surprise[i] >= 2) {
+            if (phi[0] != 0.0f) P[0][0] = f_max(P[0][0], 0.05f);
+            if (phi[1] != 0.0f) P[1][1] = f_max(P[1][1], 0.05f);
+            P[0][1] = P[1][0] = 0.0f;
+            Pp0 = P[0][0] * phi[0] + P[0][1] * phi[1];
+            Pp1 = P[1][0] * phi[0] + P[1][1] * phi[1];
+            den = lam + phi[0] * Pp0 + phi[1] * Pp1;
+            a->surprise[i] = 0;
+        }
+    } else a->surprise[i] = 0;
+    float K0 = Pp0 / den, K1 = Pp1 / den;
+    a->s[i][0] = f_clamp(a->s[i][0] + K0 * e, 0.3f, 3.0f);
+    a->s[i][1] = f_clamp(a->s[i][1] + K1 * e, 0.3f, 3.0f);
+    float p00 = (P[0][0] - K0 * Pp0) / (phi[0] != 0.0f ? lam : 1.0f);
+    float p11 = (P[1][1] - K1 * Pp1) / (phi[1] != 0.0f ? lam : 1.0f);
+    float p01 = (phi[0] != 0.0f && phi[1] != 0.0f) ? (P[0][1] - K0 * Pp1) / lam : 0.0f;
+    P[0][0] = f_min(p00, 0.25f); P[0][1] = p01; P[1][0] = p01; P[1][1] = f_min(p11, 0.25f);
+    a->windows[i]++;
+}
+
+void adapt_update(Adapt *a, const fc_config_t *c, const float w[3], const float u[3], float qbar,
+                  float tw, float V, int enable, int light_tick)
+{
+    if (!enable) a->pend = 0;
+    if (a->pend && light_tick) {             /* one axis of the last window per tick with no sensor work */
+        int i = (a->pend & 1) ? 0 : ((a->pend & 2) ? 1 : 2);
+        a->pend &= (uint8_t)~(1u << i);
+        if (enable) window_axis(a, c, i);
+    }
     if (!enable || !a->have_prev) {           /* restart the window */
         for (int i = 0; i < 3; i++) a->w_prev[i] = w[i];
         a->have_prev = 1;
@@ -186,43 +242,13 @@ void adapt_update(Adapt *a, const fc_config_t *c, const float w[3], const float 
     a->Vsum += V;
     if (++a->k < AD_WIN) return;
 
-    if (a->valid) {
-        const float invN = 1.0f / (float)AD_WIN;
-        float Vm = a->Vsum * invN;
+    if (a->valid) {                          /* hand the window over; evaluated over the next 3 ticks */
         for (int i = 0; i < 3; i++) {
-            float Y = f_sqrt(a->ys[i] * a->ys[i] + a->yc[i] * a->yc[i]);
-            float U = f_sqrt(a->us[i] * a->us[i] + a->uc[i] * a->uc[i]);
-            float Unet = U * 2.0f * invN;
-            a->amp[i] = f_clamp(a->amp[i] * f_clamp(AD_UNET / f_max(Unet, 1e-3f), 0.5f, 2.0f), 0.02f, 0.12f);
-            if (Unet < 0.6f * AD_UNET) continue;         /* too small yet: backlash would bias it */
-            float Om = F_2PI * (float)AD_HZ[i];
-            float servo = 1.0f / f_sqrt(1.0f + Om * SERVO_TAU * Om * SERVO_TAU);
-            float D = AD_D0[i] * Vm;
-            float phi[2] = {a->rq[i] * invN, a->rw[i] * invN};
-            float cal = (c->auth_lockin_cal[i] * phi[0] + c->auth_lockin_cal_w[i] * phi[1]) / f_max(phi[0] + phi[1], 1e-6f);
-            float A = Y / (U * servo) * f_sqrt(1.0f + (D / Om) * (D / Om)) / cal;
-            /* only learn the part this flight condition actually exercises */
-            if (phi[1] < 0.25f * phi[0]) phi[1] = 0.0f;
-            else if (phi[0] < 0.25f * phi[1]) phi[0] = 0.0f;
-            /* normalise by the expected measurement scatter (~15 %) */
-            float sig = 0.15f * f_max(A, 8.0f);
-            phi[0] /= sig; phi[1] /= sig;
-            float y = A / sig;
-            float (*P)[2] = a->P[i];
-            float Pp0 = P[0][0] * phi[0] + P[0][1] * phi[1];
-            float Pp1 = P[1][0] * phi[0] + P[1][1] * phi[1];
-            const float lam = 0.97f;
-            float den = lam + phi[0] * Pp0 + phi[1] * Pp1;
-            float e = y - (a->s[i][0] * phi[0] + a->s[i][1] * phi[1]);
-            float K0 = Pp0 / den, K1 = Pp1 / den;
-            a->s[i][0] = f_clamp(a->s[i][0] + K0 * e, 0.3f, 3.0f);
-            a->s[i][1] = f_clamp(a->s[i][1] + K1 * e, 0.3f, 3.0f);
-            float p00 = (P[0][0] - K0 * Pp0) / (phi[0] != 0.0f ? lam : 1.0f);
-            float p11 = (P[1][1] - K1 * Pp1) / (phi[1] != 0.0f ? lam : 1.0f);
-            float p01 = (phi[0] != 0.0f && phi[1] != 0.0f) ? (P[0][1] - K0 * Pp1) / lam : 0.0f;
-            P[0][0] = f_min(p00, 0.25f); P[0][1] = p01; P[1][0] = p01; P[1][1] = f_min(p11, 0.25f);
-            a->windows[i]++;
+            a->wys[i] = a->ys[i]; a->wyc[i] = a->yc[i]; a->wus[i] = a->us[i]; a->wuc[i] = a->uc[i];
+            a->wrq[i] = a->rq[i]; a->wrw[i] = a->rw[i];
         }
+        a->wVm = a->Vsum * (1.0f / (float)AD_WIN);
+        a->pend = 7;
     }
     a->k = 0;
     a->valid = 1;

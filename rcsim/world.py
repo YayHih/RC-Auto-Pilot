@@ -98,6 +98,35 @@ class Atmosphere:
         return w
 
 
+class Morpher:
+    """Random in-flight changes to the aeroplane (the flight controller is not told): every ~interval s
+    one property ramps over `ramp` s to a new random value - control-surface size per axis, wing chord
+    (lift/area) or extra drag (a drag plate).  Only while airborne."""
+    LIM = dict(ail=(0.5, 1.8), ele=(0.5, 1.8), rud=(0.5, 1.8), wing=(0.75, 1.3), drag=(1.0, 3.0))
+
+    def __init__(self, rng, interval=20.0, ramp=2.0):
+        self.rng, self.interval, self.ramp = rng, interval, ramp
+        self.cur = {k: 1.0 for k in self.LIM}
+        self.key, self.v0, self.v1, self.t = None, 1.0, 1.0, 0.0
+        self.events = []
+
+    def update(self, t, dt, airborne):
+        """Advance; returns the dict of current factors if anything changed."""
+        if self.key is None:
+            if airborne and self.rng.random() < dt / self.interval:
+                self.key = str(self.rng.choice(list(self.LIM)))
+                lo, hi = self.LIM[self.key]
+                self.v0, self.v1, self.t = self.cur[self.key], float(self.rng.uniform(lo, hi)), 0.0
+                self.events.append((t, self.key, self.v0, self.v1))
+            return None
+        self.t += dt
+        f = min(self.t / self.ramp, 1.0)
+        self.cur[self.key] = self.v0 + f * (self.v1 - self.v0)
+        if f >= 1.0:
+            self.key = None
+        return dict(self.cur)
+
+
 class Servo:
     """Hobby servo: latches a pulse each 20 ms frame, deadband, backlash, rate limit, first-order lag."""
 
@@ -172,7 +201,8 @@ class Sim:
     """seed fixes every random draw (sensors, build tolerances, wind, turbulence, gusts) so a run can be
     replayed.  wind / wind_from default to a random draw from the seed; randomize scales the airframe
     tolerances (0 = nominal model); plane = dict of factors for a different aeroplane
-    (ail, ele, rud, mass, thrust - see Airframe.modify).
+    (ail, ele, rud, mass, thrust, scale, surf, wing - see Airframe.modify); morph = mean interval (s)
+    between random in-flight changes of control-surface size / wing / drag (0 = off, see Morpher).
 
     fc = 'native'   C++ flight controller compiled for this PC (fast; default)
          'arm'      the Cortex-M0+ machine code in the Unicorn emulator, cycle-counted at 48 MHz
@@ -183,7 +213,7 @@ class Sim:
     NATIVE_COMPUTE_US = 2800  # typical in-flight compute on the M0+ (measured with fc='arm')
 
     def __init__(self, seed=1, wind=None, wind_from=None, turb=1.0, randomize=1.0, gusts=1.0,
-                 fc='native', plane=None, cfg=None, cycle_every=10):
+                 fc='native', plane=None, cfg=None, cycle_every=10, morph=0.0):
         self.af = Airframe()
         self.af.randomize(np.random.default_rng(seed + 200), randomize)
         if plane:
@@ -203,6 +233,7 @@ class Sim:
         else:
             self.fc = fb.NativeFC(cfg)
         self.fc_kind = fc
+        self.morpher = Morpher(np.random.default_rng(seed + 400), morph) if morph else None
         self.cfg = self.fc.cfg
         self.pca = PCA9685(self.cfg.pca_osc_hz, self.cfg.pca_prescale, float(self.rng.uniform()))
         self.mpu = MPU6050(DT)
@@ -309,6 +340,10 @@ class Sim:
     def _step_core(self):
         if self.n % 2 == 0:
             self._fc_tick()
+        if self.morpher is not None and self.n % 20 == 0:          # 10 Hz
+            m = self.morpher.update(self.t, 20 * DT, -self.x[2] > 5.0 and not self.af.on_ground)
+            if m:
+                self.af.set_morph(**m)
         for _, pulses in self.pca.frames_until(self.clock + DT):
             for i in range(4):
                 ch = i if i < 3 else 4
@@ -365,7 +400,8 @@ class Sim:
             evel=np.array(o.vel[:]), thr=self.duty, surf=self.servo.copy(), T=self.T,
             crashed=self.af.crashed, R=R, wind_est=np.array(o.wind[:]), wind_true=self.wind_now.copy(),
             airspeed_est=o.airspeed, airspeed=float(np.linalg.norm(self.x[3:6] - self.wind_now)),
-            auth_q=np.array(o.auth_q[:]), auth_w=np.array(o.auth_w[:]), pca=list(o.pca_off[:5])))
+            auth_q=np.array(o.auth_q[:]), auth_w=np.array(o.auth_w[:]), pca=list(o.pca_off[:5]),
+            morph=dict(self.af.morph)))
 
     def press(self, name):
         self._cmd = fb.CMDS.get(name, 0)

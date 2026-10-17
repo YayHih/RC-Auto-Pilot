@@ -172,6 +172,7 @@ class Airframe:
         self.crashed = False
         self.crash_reason = ''
         self.on_ground = False
+        self.morph = dict(ail=1.0, ele=1.0, rud=1.0, wing=1.0, drag=1.0)
 
         self._build()
         self.info = dict(T=0.0, I=0.0, Vb=self.v_oc(0.0), rpm=0.0, Q=0.0, vi=0.0, ae=np.zeros(self.N), P_ext=0.0)
@@ -192,21 +193,43 @@ class Airframe:
         self.Iinv = np.linalg.inv(I)
         self.rp = self.prop_pos0 - cg
         self.Ke = 60.0 / (2 * np.pi * self.Kv)             # V/(rad/s) == Nm/A
+        self.M_RB = np.zeros((6, 6))
+        self.M_RB[:3, :3] = m * np.eye(3)
+        self.M_RB[3:, 3:] = I
+        self._build_aero()
+        self.fus_r = self.fus_r0 - cg
+        self.pts = [(p - cg, k) for p, k in self.pts0]
+        self.zc = np.zeros((len(self.pts), 2))              # tangential bristle deflection, world xy
 
+    def _build_aero(self):
+        """Strip geometry and coefficients from the build rows with the in-flight morph applied
+        (no change to mass, CG or the flight state, so it can be called while flying)."""
+        cg = self.cg_datum
+        mo = self.morph
         rows = self.strip_rows
         self.N = len(rows)
+        chord, tau, cd0 = [], [], []
+        for r in rows:
+            k = r['K']
+            ks = mo['ail'] if k[0] else (mo['ele'] if k[1] else (mo['rud'] if k[2] else None))
+            chord.append(r['chord'] * (mo['wing'] if r['kind'] == 0 else 1.0))
+            # a bigger control surface (larger flap chord): more effectiveness (thin-aerofoil flap theory
+            # goes roughly with sqrt of the flap-chord ratio), a little more profile drag (gaps, area)
+            tau.append(min(r['tau'] * ks ** 0.6, 0.95) if ks else r['tau'])
+            cd0.append(r['CD0'] + (0.004 * (ks - 1.0) if ks else 0.0))
+        self.CdA_plate = 0.006 * max(mo['drag'] - 1.0, 0.0)   # airbrake plate on top of the fuselage
         self.sr = np.array([r['r'] for r in rows], float) - cg
         self.sspan = np.array([r['span'] for r in rows])
-        self.schord = np.array([r['chord'] for r in rows])
+        self.schord = np.array(chord)
         self.sS = self.sspan * self.schord
         self.sn = np.array([r['n'] for r in rows], float)
         self.sc = np.tile(EX, (self.N, 1))
         self.sCLa = np.array([r['CLa'] for r in rows])
-        self.sAR = np.array([r['AR'] for r in rows])
-        self.sCD0 = np.array([r['CD0'] for r in rows])
+        self.sAR = np.array([r['AR'] for r in rows]) / np.where(np.array([r['kind'] for r in rows]) == 0, mo['wing'], 1.0)
+        self.sCD0 = np.array(cd0)
         self.sastall = np.array([r['a_stall'] for r in rows])
         self.sCN90 = np.array([r['CN90'] for r in rows])
-        self.stau = np.array([r['tau'] for r in rows])
+        self.stau = np.array(tau)
         self.sdmax = np.array([r['dmax'] for r in rows])
         self.sK = np.array([r['K'] for r in rows], float)
         self.smix = np.array([r['mix'] for r in rows])
@@ -247,14 +270,18 @@ class Airframe:
             sdir_i = _cross(self.sc[i], self.sn[i])
             ar = np.pi / 128 * self.schord[i] ** 4 * self.sspan[i]
             self.A1[3:, 3:] += ar * np.outer(sdir_i, sdir_i)
-        self.M_RB = np.zeros((6, 6))
-        self.M_RB[:3, :3] = m * np.eye(3)
-        self.M_RB[3:, 3:] = I
         self._rho_cached = None
 
-        self.fus_r = self.fus_r0 - cg
-        self.pts = [(p - cg, k) for p, k in self.pts0]
-        self.zc = np.zeros((len(self.pts), 2))              # tangential bristle deflection, world xy
+    MORPH_KEYS = ('ail', 'ele', 'rud', 'wing', 'drag')
+
+    def set_morph(self, **kw):
+        """Change the aeroplane in flight: ail/ele/rud = control-surface size (chord) factor, wing = wing
+        chord (lift, area) factor, drag = 1 + extra drag from an airbrake plate.  Mass and CG are unchanged."""
+        for k, v in kw.items():
+            if k not in self.MORPH_KEYS:
+                raise KeyError(k)
+            self.morph[k] = float(v)
+        self._build_aero()
 
     def _Minv(self, rho):
         if rho != self._rho_cached:
@@ -446,6 +473,14 @@ class Airframe:
             Ft += Ff
             Mt += _cross(self.fus_r[j], Ff)
             P += float(Ff @ uf)
+
+        if self.CdA_plate > 0.0:                          # airbrake plate on top of the fuselage
+            rpl = np.array([-0.02, 0.0, -0.045 - 0.5 * np.sqrt(self.CdA_plate / 1.2)])
+            up = va + _cross(w, rpl)
+            Fp = -0.5 * rho * self.CdA_plate * np.linalg.norm(up) * up
+            Ft += Fp
+            Mt += _cross(rpl, Fp)
+            P += float(Fp @ up)
 
         # tail downwash target from the wing's mean lift coefficient, lagged by convection time
         wing2 = np.tile(self.is_wing, 2)

@@ -384,46 +384,58 @@ class PlaneModel:
                       np.array([0.10, 0.16, 0.26])))
         return faces
 
-    def build(self, defl, phase, thr, show_prop=True):
+    def build(self, defl, phase, thr, show_prop=True, shape=None):
+        """shape = Airframe.morph: ail/ele/rud surface-chord factors, wing chord factor, drag factor
+        (a red drag plate under the fuselage, sized from the extra drag area)."""
+        sh = shape or {}
+        k_ail, k_ele, k_rud = sh.get('ail', 1.0), sh.get('ele', 1.0), sh.get('rud', 1.0)
+        k_wing, k_drag = sh.get('wing', 1.0), sh.get('drag', 1.0)
         da, de, dr = defl
         out = [(q, c, 1.0) for q, c in self._fuse]
         A = SURF_THROW
         le = lambda y: 0.115 - 0.05 * abs(y) / 0.5
-        te = lambda y: -0.095 + 0.03 * abs(y) / 0.5
+        te0 = lambda y: -0.095 + 0.03 * abs(y) / 0.5
+        chord = lambda y: (le(y) - te0(y)) * k_wing                # wing chord grows aft of the leading edge
+        te = lambda y: le(y) - chord(y)
         for side in (-1.0, 1.0):
-            ya, yb, yc, ch = 0.05, 0.17, 0.49, 0.056
-            for (y0, y1, hinge) in ((ya, yb, False), (yb, yc, True)):
-                xt0 = te(y0) + (ch if hinge else 0.0)
-                xt1 = te(y1) + (ch if hinge else 0.0)
-                out.append((np.array([[le(y0), side * y0, 0], [le(y1), side * y1, 0], [xt1, side * y1, 0],
-                                      [xt0, side * y0, 0]]), self.C_WING, 1.0))
+            ya, yb, yc = 0.05, 0.17, 0.49
+            ach = lambda y: min(0.056 * k_ail * k_wing, 0.6 * chord(y))   # aileron chord
+            out.append((np.array([[le(ya), side * ya, 0], [le(yb), side * yb, 0], [te(yb), side * yb, 0],
+                                  [te(ya), side * ya, 0]]), self.C_WING, 1.0))
+            out.append((np.array([[le(yb), side * yb, 0], [le(yc), side * yc, 0], [te(yc) + ach(yc), side * yc, 0],
+                                  [te(yb) + ach(yb), side * yb, 0]]), self.C_WING, 1.0))
             delta = (-side * da) * A
             pts = []
             for y, edge in ((yb, 0), (yc, 0), (yc, 1), (yb, 1)):
-                hx = te(y) + ch
+                hx, ch = te(y) + ach(y), ach(y)
                 pts.append([hx, side * y, 0.0] if edge == 0 else
                            [hx - ch * np.cos(delta), side * y, ch * np.sin(delta)])
             out.append((np.array(pts), self.C_AIL, 1.0))
-            sy0, sy1, chd = 0.016, 0.26, 0.062
+            sy0, sy1 = 0.016, 0.26
             lex = lambda y: -0.415 - 0.025 * y / 0.26
             tex = lambda y: -0.565 + 0.020 * y / 0.26
-            out.append((np.array([[lex(sy0), side * sy0, 0], [lex(sy1), side * sy1, 0], [tex(sy1) + chd, side * sy1, 0],
-                                  [tex(sy0) + chd, side * sy0, 0]]), self.C_WING, 1.0))
+            chd = lambda y: min(0.062 * k_ele, 0.75 * (lex(y) - tex(y)))   # elevator chord
+            out.append((np.array([[lex(sy0), side * sy0, 0], [lex(sy1), side * sy1, 0], [tex(sy1) + chd(sy1), side * sy1, 0],
+                                  [tex(sy0) + chd(sy0), side * sy0, 0]]), self.C_WING, 1.0))
             delta_e = -de * A
             pts = []
             for y, edge in ((sy0, 0), (sy1, 0), (sy1, 1), (sy0, 1)):
-                hx = tex(y) + chd
+                hx, ch = tex(y) + chd(y), chd(y)
                 pts.append([hx, side * y, 0.0] if edge == 0 else
-                           [hx - chd * np.cos(delta_e), side * y, chd * np.sin(delta_e)])
+                           [hx - ch * np.cos(delta_e), side * y, ch * np.sin(delta_e)])
             out.append((np.array(pts), self.C_ELEV, 1.0))
         out.append((np.array([[-0.370, 0, -0.012], [-0.470, 0, -0.225], [-0.510, 0, -0.225], [-0.500, 0, 0.0],
                               [-0.500, 0, 0.075], [-0.430, 0, 0.050]]), self.C_FIN, 1.0))
-        crd = 0.072
+        crd = 0.072 * k_rud
         delta_r = -dr * A
         c_, s_ = np.cos(delta_r), np.sin(delta_r)
         out.append((np.array([[-0.510, 0, -0.225], [-0.500, 0, 0.075],
                               [-0.500 - crd * 0.85 * c_, crd * 0.85 * s_, 0.075],
                               [-0.510 - crd * c_, crd * s_, -0.225]]), self.C_RUD, 1.0))
+        if k_drag > 1.001:                         # airbrake plate on top of the fuselage, area = CdA / 1.2
+            half = 0.5 * np.sqrt(0.006 * (k_drag - 1.0) / 1.2)
+            out.append((np.array([[-0.02, -half, -0.045], [-0.02, half, -0.045], [-0.02, half, -0.045 - 2 * half],
+                                  [-0.02, -half, -0.045 - 2 * half]]), np.array([0.85, 0.10, 0.10]), 1.0))
         wheel = np.array([0.10, 0.10, 0.11])
         for x, y in ((-0.04, -0.16), (-0.04, 0.16), (0.28, 0.0)):
             out.append((np.array([[x - 0.004, y, 0.03], [x + 0.004, y, 0.03], [x + 0.004, y, 0.074], [x - 0.004, y, 0.074]]),
@@ -627,6 +639,7 @@ class FrameBuilder:
         pos = x[0:3]
         S = self.vscale
         faces = self.plane.build((sim.servo[0], sim.servo[1], sim.servo[2]), sim.rotor_phase, sim.duty,
+                                 shape=getattr(sim.af, 'morph', None),
                                  show_prop=self.mode != 'fpv')
         if self.mode == 'fpv':                       # camera sits at the nose: hide the spinner
             faces = [f for f in faces if f[0][:, 0].min() < 0.49]
